@@ -1,6 +1,0 @@
-[workspace]
-
-members = [
-    "nes_core",
-    "nes_ui",
-]
