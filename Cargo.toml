@@ -1,0 +1,16 @@
+[package]
+name = "rusty-nes-emulator"
+version = "0.1.0"
+authors = ["Eli Lipsitz <eli.lipsitz@gmail.com>"]
+edition = "2018"
+
+[dependencies]
+sdl2 = "0.38"
+
+[lib]
+name = "rusty_nes_emulator"
+path = "src/lib.rs"
+
+[[bin]]
+name = "rusty-nes-emulator"
+path = "src/main.rs"
