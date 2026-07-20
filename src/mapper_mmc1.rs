@@ -1,0 +1,244 @@
+use std::io::{self, Read, Write};
+
+use super::cartridge::Cartridge;
+use super::mapper::{translate_vram, Mapper, MirrorMode};
+use super::save_state::{ReadState, WriteState};
+
+pub struct MapperMmc1 {
+    cart: Cartridge,
+    ram: [u8; 8192],
+    vram: [u8; 2048],
+
+    shift_number: u8,
+    shift_data: u8,
+    reg_control: u8,
+    reg_chr0: u8,
+    reg_chr1: u8,
+    reg_prg: u8,
+
+    mirror_mode: MirrorMode,
+    offset_prg0: usize,
+    offset_prg1: usize,
+    offset_chr0: usize,
+    offset_chr1: usize,
+
+    prg_len: usize,
+    prg_power_of_two: bool,
+    prg_mask: usize,
+    chr_len: usize,
+    chr_power_of_two: bool,
+    chr_mask: usize,
+}
+
+impl MapperMmc1 {
+    pub const ID: u8 = 1;
+
+    pub fn new(cart: Cartridge) -> MapperMmc1 {
+        let prg_len = cart.prg_rom.len();
+        let chr_len = cart.chr_rom.len();
+        let prg_power_of_two = prg_len.is_power_of_two();
+        let chr_power_of_two = chr_len.is_power_of_two();
+        let prg_mask = if prg_power_of_two { prg_len - 1 } else { 0 };
+        let chr_mask = if chr_power_of_two { chr_len - 1 } else { 0 };
+        let mut mapper = MapperMmc1 {
+            cart,
+            ram: [0; 8192],
+            vram: [0; 2048],
+            shift_number: 0,
+            shift_data: 0,
+            reg_control: 0x1F,
+            reg_chr0: 0,
+            reg_chr1: 0,
+            reg_prg: 0,
+            mirror_mode: MirrorMode::MirrorHorizontal,
+            offset_prg0: 0,
+            offset_prg1: 0,
+            offset_chr0: 0,
+            offset_chr1: 0,
+            prg_len,
+            prg_power_of_two,
+            prg_mask,
+            chr_len,
+            chr_power_of_two,
+            chr_mask,
+        };
+        mapper.update_mapping();
+        mapper
+    }
+
+    fn update_mapping(&mut self) {
+        self.mirror_mode = match self.reg_control & 0b11 {
+            0 => MirrorMode::MirrorSingleA,
+            1 => MirrorMode::MirrorSingleB,
+            2 => MirrorMode::MirrorVertical,
+            3 => MirrorMode::MirrorHorizontal,
+            _ => unreachable!(),
+        };
+
+        let prg_mode = (self.reg_control & 0b01100) >> 2;
+        let chr_mode = (self.reg_control & 0b10000) >> 4;
+
+        match prg_mode {
+            0 | 1 => {
+                let prg_bank = (16 * 1024) * ((self.reg_prg as usize) & 0b01110);
+                self.offset_prg0 = prg_bank;
+                self.offset_prg1 = prg_bank + (16 * 1024);
+            }
+            2 => {
+                self.offset_prg0 = 0;
+                self.offset_prg1 = (16 * 1024) * ((self.reg_prg as usize) & 0b01111);
+            }
+            3 => {
+                self.offset_prg0 = (16 * 1024) * ((self.reg_prg as usize) & 0b01111);
+                self.offset_prg1 = self.prg_len - (16 * 1024);
+            }
+            _ => unreachable!(),
+        }
+        self.offset_prg0 = if self.prg_power_of_two { self.offset_prg0 & self.prg_mask } else { self.offset_prg0 % self.prg_len };
+        self.offset_prg1 = if self.prg_power_of_two { self.offset_prg1 & self.prg_mask } else { self.offset_prg1 % self.prg_len };
+
+        match chr_mode {
+            0 => {
+                self.offset_chr0 = ((self.reg_chr0 as usize) & 0b11110) * (4 * 1024);
+                self.offset_chr1 = self.offset_chr0 + (4 * 1024);
+            }
+            1 => {
+                self.offset_chr0 = (self.reg_chr0 as usize) * (4 * 1024);
+                self.offset_chr1 = (self.reg_chr1 as usize) * (4 * 1024);
+            }
+            _ => unreachable!(),
+        }
+        self.offset_chr0 = if self.chr_power_of_two { self.offset_chr0 & self.chr_mask } else { self.offset_chr0 % self.chr_len };
+        self.offset_chr1 = if self.chr_power_of_two { self.offset_chr1 & self.chr_mask } else { self.offset_chr1 % self.chr_len };
+    }
+
+    fn handle_control(&mut self, register: u16, data: u8) {
+        match register {
+            0 => self.reg_control = data,
+            1 => self.reg_chr0 = data,
+            2 => self.reg_chr1 = data,
+            3 => self.reg_prg = data,
+            _ => {}
+        }
+        self.update_mapping();
+    }
+}
+
+impl Mapper for MapperMmc1 {
+    fn peek(&mut self, addr: u16) -> u8 {
+        match addr {
+            // PPU
+            0x0000..=0x0FFF => self.cart.chr_rom[self.offset_chr0 + (addr & 0xFFF) as usize],
+            0x1000..=0x1FFF => self.cart.chr_rom[self.offset_chr1 + (addr & 0xFFF) as usize],
+            0x2000..=0x3EFF => self.vram[translate_vram(self.mirror_mode, addr)],
+
+            // CPU
+            0x6000..=0x7FFF => self.ram[(addr & 0x1FFF) as usize],
+            0x8000..=0xBFFF => self.cart.prg_rom[self.offset_prg0 + (addr & 0x3FFF) as usize],
+            0xC000..=0xFFFF => self.cart.prg_rom[self.offset_prg1 + (addr & 0x3FFF) as usize],
+            _ => 0,
+        }
+    }
+
+    fn poke(&mut self, addr: u16, val: u8) {
+        match addr {
+            // PPU
+            0x0000..=0x0FFF => self.cart.chr_rom[self.offset_chr0 + (addr & 0xFFF) as usize] = val,
+            0x1000..=0x1FFF => self.cart.chr_rom[self.offset_chr1 + (addr & 0xFFF) as usize] = val,
+            0x2000..=0x3EFF => self.vram[translate_vram(self.mirror_mode, addr)] = val,
+
+            // CPU
+            0x6000..=0x7FFF => self.ram[(addr & 0x1FFF) as usize] = val,
+            0x8000..=0xFFFF => {
+                if val & 0x80 > 0 {
+                    self.shift_data = 0;
+                    self.shift_number = 0;
+                    self.reg_control |= 0x0C;
+                    self.update_mapping();
+                } else {
+                    self.shift_data |= (val & 0x1) << self.shift_number;
+                    self.shift_number += 1;
+
+                    if self.shift_number == 5 {
+                        let register = (addr >> 13) & 0b11;
+                        self.handle_control(register, self.shift_data);
+                        self.shift_number = 0;
+                        self.shift_data = 0;
+                    }
+                }
+            }
+            _ => {}
+        };
+    }
+
+    fn get_id(&self) -> u8 {
+        Self::ID
+    }
+
+    fn update_cartridge(&mut self, cartridge: Cartridge) {
+        self.prg_len = cartridge.prg_rom.len();
+        self.chr_len = cartridge.chr_rom.len();
+        self.prg_power_of_two = self.prg_len.is_power_of_two();
+        self.chr_power_of_two = self.chr_len.is_power_of_two();
+        self.prg_mask = if self.prg_power_of_two { self.prg_len - 1 } else { 0 };
+        self.chr_mask = if self.chr_power_of_two { self.chr_len - 1 } else { 0 };
+        self.cart = cartridge;
+    }
+
+    fn get_prg_rom_offset(&self, addr: u16) -> Option<u32> {
+        match addr {
+            0x8000..=0xBFFF => Some((self.offset_prg0 + (addr & 0x3FFF) as usize) as u32),
+            0xC000..=0xFFFF => Some((self.offset_prg1 + (addr & 0x3FFF) as usize) as u32),
+            _ => None,
+        }
+    }
+
+    fn get_sram(&self) -> Option<&[u8]> {
+        Some(&self.ram)
+    }
+
+    fn set_sram(&mut self, data: &[u8]) {
+        let len = usize::min(data.len(), self.ram.len());
+        self.ram[..len].copy_from_slice(&data[..len]);
+    }
+
+    fn write_state_to(&self, writer: &mut dyn Write) -> io::Result<()> {
+        self.ram.write(writer)?;
+        self.vram.write(writer)?;
+        self.shift_number.write(writer)?;
+        self.shift_data.write(writer)?;
+        self.reg_control.write(writer)?;
+        self.reg_chr0.write(writer)?;
+        self.reg_chr1.write(writer)?;
+        self.reg_prg.write(writer)?;
+        self.mirror_mode.write(writer)?;
+        self.offset_prg0.write(writer)?;
+        self.offset_prg1.write(writer)?;
+        self.offset_chr0.write(writer)?;
+        self.offset_chr1.write(writer)
+    }
+
+    fn read_state_from(&mut self, reader: &mut dyn Read) -> io::Result<()> {
+        self.ram = ReadState::read(reader)?;
+        self.vram = ReadState::read(reader)?;
+        self.shift_number = ReadState::read(reader)?;
+        self.shift_data = ReadState::read(reader)?;
+        self.reg_control = ReadState::read(reader)?;
+        self.reg_chr0 = ReadState::read(reader)?;
+        self.reg_chr1 = ReadState::read(reader)?;
+        self.reg_prg = ReadState::read(reader)?;
+        self.mirror_mode = ReadState::read(reader)?;
+        self.offset_prg0 = ReadState::read(reader)?;
+        self.offset_prg1 = ReadState::read(reader)?;
+        self.offset_chr0 = ReadState::read(reader)?;
+        self.offset_chr1 = ReadState::read(reader)?;
+        self.prg_len = self.cart.prg_rom.len();
+        self.chr_len = self.cart.chr_rom.len();
+        self.prg_power_of_two = self.prg_len.is_power_of_two();
+        self.chr_power_of_two = self.chr_len.is_power_of_two();
+        self.prg_mask = if self.prg_power_of_two { self.prg_len - 1 } else { 0 };
+        self.chr_mask = if self.chr_power_of_two { self.chr_len - 1 } else { 0 };
+        self.update_mapping();
+        Ok(())
+    }
+}
